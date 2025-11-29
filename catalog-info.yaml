@@ -1,0 +1,46 @@
+---
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: "mmagent03"
+  description: This is Agent Deploymnt
+  tags:
+    - langgraph
+  annotations:
+    backstage.io/kubernetes-label-selector: 'entity-id=mmagent03'
+    argocd/app-selector: 'entity-id=mmagent03'
+    backstage.io/kubernetes-cluster: workshop
+    argo-workflows.cnoe.io/cluster-name: local
+    argo-workflows.cnoe.io/namespace: mmagent03
+    argo-workflows.cnoe.io/label-selector: 'entity-id=mmagent03'
+    backstage.io/techdocs-ref: dir:.
+  links:
+    - url: https://github.com/cnoe-idp-demo/mmagent03
+      title: Agent Repo
+      icon: github
+    - url: https://github.com/cnoe-idp-demo/mmagent03-deploy
+      title: Agent Deploy Repo
+      icon: github
+spec:
+  owner: guests
+  lifecycle: experimental
+  type: agent
+  system: "LangGraph"
+  providesApis: ['api:mmagent03']
+---
+apiVersion: backstage.io/v1alpha1
+kind: System
+metadata:
+  name: "LangGraph"
+  description: An example system for demonstration purpose
+  links:
+    - url: https://github.com/cnoe-idp-demo/mmagent03
+      title: Agent Repo URL
+      icon: github
+    - url: https://github.com/cnoe-idp-demo/mmagent03-deploy
+      title: Agent Deploy Repo URL
+      icon: github
+spec:
+  owner: guests
+  lifecycle: experimental
+  type: agent

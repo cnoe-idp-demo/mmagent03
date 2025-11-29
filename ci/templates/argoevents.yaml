@@ -1,0 +1,230 @@
+apiVersion: argoproj.io/v1alpha1
+kind: EventSource
+metadata:
+  name: "{{ .Values.agentName }}"
+  namespace: {{ .Values.namespace }}
+spec:
+  service:
+    ports:
+      - port: 12000
+        targetPort: 12000
+  webhook:
+    github:
+      port: "12000"
+      endpoint: /
+      method: POST
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Sensor
+metadata:
+  name: "{{ .Values.agentName }}-ci"
+  namespace: {{ .Values.namespace }}
+spec:
+  template:
+    serviceAccountName: operate-workflow-sa
+  dependencies:
+    - name: test-dep
+      eventSourceName: "{{ .Values.agentName }}"
+      eventName: github
+  triggers:
+    - template:
+        name: "{{ .Values.agentName }}-argo-workflow-trigger"
+        argoWorkflow:
+          operation: submit
+          source:
+            resource:
+              apiVersion: argoproj.io/v1alpha1
+              kind: Workflow
+              metadata:
+                generateName: "ci-{{ .Values.agentName }}-"
+                namespace: {{ .Values.namespace }}
+                labels:
+                  env: dev
+                  entity-id: "{{ .Values.agentName }}"
+              spec:
+                serviceAccountName: ci-workflow-sa
+                entrypoint: ci-build
+                nodeSelector:
+                  kubernetes.io/arch: amd64
+                arguments:
+                  parameters:
+                    - name: appName
+                      value: "{{ .Values.agentName}}"
+                    - name: apprepo
+                      value: "https://github.com/cnoe-idp-demo/{{ .Values.agentName }}"
+                    - name: branch
+                      value: main
+                    - name: deployrepo
+                      value: "https://github.com/cnoe-idp-demo/{{ .Values.agentName}}-deploy"
+                    - name: image
+                      value: "{{ .Values.imageBase }}/{{ .Values.agentName }}"
+                    - name: commit_sha
+                      value: latest
+                volumeClaimTemplates:
+                  - metadata:
+                      name: workdir
+                    spec:
+                      accessModes: ["ReadWriteOnce"]
+                      resources:
+                        requests:
+                          storage: 256Mi
+                templates:
+                  - name: ci-build
+                    dag:
+                      tasks:
+                        - name: clone
+                          template: clonerepo
+                          arguments:
+                            parameters:
+                              - name: apprepo
+                                value: "{{`{{workflow.parameters.apprepo}}`}}"
+                              - name: branch
+                                value: "{{`{{workflow.parameters.branch}}`}}"
+
+                        - name: build-arm64-image
+                          template: build-image-with-kaniko
+                          arguments:
+                            parameters:
+                              - name: image
+                                value: "{{`{{workflow.parameters.image}}`}}"
+                              - name: tag-version
+                                value: "{{`{{workflow.parameters.commit_sha}}`}}"
+                              - name: image-name
+                                value: {{ .Values.agentName }}
+                          depends: "clone"
+                        
+                        - name: invoke-cd-workflow
+                          template: invoke-cd-workflow
+                          arguments:
+                            parameters:
+                              - name: tag_version
+                                value: "{{`{{workflow.parameters.commit_sha}}`}}"
+                          depends: "build-arm64-image"
+
+                  - name: clonerepo
+                    inputs:
+                      parameters:
+                        - name: apprepo
+                        - name: branch
+                    container:
+                      volumeMounts:
+                        - mountPath: /workdir
+                          name: workdir
+                      image: alpine/git:v2.45.1
+                      workingDir: /workdir/agent
+                      args:
+                        - clone
+                        - --depth
+                        - "1"
+                        - --branch
+                        - "{{`{{inputs.parameters.branch}}`}}"
+                        - --single-branch
+                        - "{{`{{inputs.parameters.apprepo}}`}}.git"
+                        - -c
+                        - http.sslVerify=false
+                        - .
+
+                  - name: build-image-with-kaniko
+                    inputs:
+                      parameters:
+                        - name: image
+                        - name: tag-version
+                        - name: image-name
+                    volumes:
+                      - name: docker-config
+                        emptyDir: {}
+                    initContainers:
+                      - name: ecr-login
+                        image: amazon/aws-cli:latest
+                        volumeMounts:
+                          - name: docker-config
+                            mountPath: /root/.docker
+                        command:
+                          - /bin/sh
+                          - -c
+                          - |
+                            mkdir -p /root/.docker
+                            PASSWORD=$(aws ecr get-login-password --region us-west-2)
+                            aws ecr create-repository --repository-name {{`{{inputs.parameters.image-name}}`}} --region us-west-2 || echo "Repository Already exists"
+                            AUTH=$(printf "AWS:%s" "${PASSWORD}" | base64 | tr -d '\n')
+                            printf '{"auths":{"229560443702.dkr.ecr.us-west-2.amazonaws.com":{"auth":"%s"}}}' "${AUTH}" > /root/.docker/config.json
+                    container:
+                      image: gcr.io/kaniko-project/executor:latest
+                      volumeMounts:
+                        - name: workdir
+                          mountPath: /workdir
+                        - name: docker-config
+                          mountPath: /kaniko/.docker
+                      workingDir: /workdir/agent
+                      resources:
+                        limits:
+                          cpu: 1
+                          memory: 2Gi
+                      args:
+                        - --dockerfile=Dockerfile
+                        - --context=.
+                        - --destination={{`{{inputs.parameters.image}}`}}:{{`{{inputs.parameters.tag-version}}`}}
+                        - --cache=false
+                        - --custom-platform=linux/amd64
+
+                  - name: invoke-cd-workflow
+                    inputs:
+                      parameters:
+                        - name: tag_version
+                    container:
+                      image: alpine:3.20
+                      volumeMounts:
+                        - mountPath: /workdir
+                          name: workdir
+                      workingDir: "/workdir"
+                      command: ["/bin/sh"]
+                      args:
+                        - -c
+                        - >-
+                          set -x &&
+                          apk add curl jq &&
+                          echo "Triggerring CD Workflow" &&
+                          image_version={{`{{inputs.parameters.tag_version}}`}} &&
+                          curl -k -s -d '{"image_version":"'${image_version}'"}' -H "Content-Type: application/json" -X POST mmagent03-deploy-eventsource-svc:12000/
+          parameters:
+            - src:
+                dependencyName: test-dep
+                dataKey: body.head_commit.id
+              dest: spec.arguments.parameters.5.value
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: "{{ .Values.agentName }}-webhook-es-ing"
+  namespace: {{ .Values.namespace }}
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: 512m
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: mmaroth.people.aws.dev
+      http:
+        paths:
+          - backend:
+              service:
+                name: "{{ .Values.agentName }}-eventsource-svc"
+                port:
+                  number: 12000
+            path: /argo-events/{{ .Values.agentName }}(/|$)(.*)
+            pathType: ImplementationSpecific
+    - host: localhost
+      http:
+        paths:
+          - backend:
+              service:
+                name: "{{ .Values.agentName }}-eventsource-svc"
+                port:
+                  number: 12000
+            path: /argo-events/{{ .Values.agentName }}(/|$)(.*)
+            pathType: ImplementationSpecific
+  tls:
+    - hosts:
+        - mmaroth.people.aws.dev
+      secretName: argo-workflows-server-tls
